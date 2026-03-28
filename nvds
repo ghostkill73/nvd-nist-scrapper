@@ -55,8 +55,8 @@ display_help() {
 }
 
 display_invalid_option() {
-	msg "Invalid option \'$1\'"
-	msg "Use \'$0 --help\' for more informations."
+	msg "Invalid option '$1'"
+	msg "Use '$0 --help' for more informations."
 	exit 1
 }
 
@@ -110,9 +110,6 @@ main() {
 	done
 	unset file
 
-	log "$OUT_FILE -> size: $(du -h $OUT_FILE | cut -f1)"
-	log "$OUT_FILE -> totalResults: $total_results"
-
 	local vulns=""
 
 	for file_index in "${!files[@]}"; do
@@ -120,11 +117,10 @@ main() {
 			vulns+=".[0].vulnerabilities"
 			continue
 		}
-		(( file_index + 1 == "${#files[@]}" )) && {
-			vulns+=" + .[$file_index].vulnerabilities"
-			break
-		}
+
 		vulns+=" + .[$file_index].vulnerabilities"
+
+		(( file_index + 1 == "${#files[@]}" )) && break
 	done
 	unset file_index
 
@@ -139,6 +135,9 @@ main() {
 			vulnerabilities: ($vulns)
 		}" \
 		"${files[@]}" > "$OUT_FILE"
+
+	log "$OUT_FILE -> size: $(du -h $OUT_FILE | cut -f1)"
+	log "$OUT_FILE -> totalResults: $total_results"
 
 	log "done."
 }
@@ -176,7 +175,7 @@ while (( $# > 0 )); do
 			exit $?
 			;;
 		*)
-			display_error "$1"
+			display_invalid_option "$1"
  			;;
 	esac
 done
