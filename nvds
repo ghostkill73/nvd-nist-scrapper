@@ -1,63 +1,168 @@
 #!/usr/bin/env bash
+# NIST NVD CVE API docs: https://nvd.nist.gov/developers/vulnerabilities
+
+# TODO: Add CPE search
+# TODO: Add --limit-date option
+
+# shellcheck disable=SC2178
+
+set -euo pipefail
+
+[[ -n "$(type -P jq)" ]] || {
+	echo "$0: ERROR: 'jq' command not found."
+	exit 1
+}
+
 ########################################
 # CONFIG
 ########################################
 
-API="https://services.nvd.nist.gov/rest/json/cves/2.0/"
-
-[[ -n "$(type -P jq)" ]] || {
-	echo "$0: 'jq' not found."
-	exit 1
-}
+NVD_API_CVE="https://services.nvd.nist.gov/rest/json/cves/2.0/"
+CONFIG_DEFAULT_OUTFILE="nvd_dump_out.json"
 
 ########################################
 # UTILS
 ########################################
 
-unix_time2date() {
-	echo $(date -d @"$1" "+%Y-%m-%dT00:00:00.000")
-}
-
-fetch_nvd_cves() {
-	local pub_start="$1"
-	local pub_end="$2"
-	local keyword="$3"
-	curl -fsSL "${API}?pubStartDate=${pub_start}&pubEndDate=${pub_end}&keywordSearch=${keyword}"
-}
-
 log() {
-	local msg="$@"
-	printf '[%(%H:%M:%S)T] %s\n' "-1" "$msg" >&2
+	printf '[%(%H:%M:%S)T] %s\n' "-1" "$@" >&2
 }
 
 msg() {
-	printf '%s\n' "$@" >&2
+	printf '%b\n' "$@" >&2
 }
 
 die() {
-	msg "$0: ERROR: $@"
+	msg "$0: ERROR: $*"
 	exit 1
+}
+
+unix_time2date() {
+	TZ=UTC command date -d @"$1" "+%Y-%m-%dT00:00:00.000"
+}
+
+date2unix_time() {
+	TZ=UTC command date -d "$1" "+%s"
+}
+
+file_size() {
+	# shellcheck disable=SC2046
+	set -- $(command du -h "$1")
+	echo "$1"
+}
+
+########################################
+# MESSAGES
+########################################
+
+display_default_message() {
+	msg "$0: missing options" \
+		"try '$0 --help' for more information."
+	exit 1
+}
+
+display_invalid_option() {
+	msg "$0: invalid option -- '$1'"
+	msg "Try '$0 --help' for more information."
+	exit 1
+}
+
+display_help() {
+	msg \
+	"Usage: $0 [OPTIONS]... [KEYWORDS]..." \
+	"Fetches CVEs from the NIST National Vulnerability Database (NVD)." \
+	"" \
+	"Examples: " \
+	"  $0 --keyword linux -t 1" \
+	"  $0 --cache-dir tmp --keyword freebsd -t 3 -o nvd_freebsd.json" \
+	"" \
+	"Options:" \
+	"  --cache-dir           set the cache directory" \
+	"  --clear-caches        clear the cache directory" \
+	"  --help, -h            display this help message" \
+	"  --keyword, -k         keyword to search for" \
+	"  --output, -o          JSON output file" \
+	"  --search-times, -t    number of times to jump over date ranges (4 months each)" \
+	"" \
+	"Repository: https://github.com/ghostkill73/nvd-nist-scrapper | WTFPLv2"
+	exit 0
 }
 
 ########################################
 # RUN
 ########################################
 
-# TODO: Improve this
-display_default_message() {
-	die "use --help."
+fetch_nvd_cves_api() {
+	local pub_start="$1" pub_end="$2"
+	command curl -fsSL -G "$NVD_API_CVE" \
+		--data-urlencode "pubStartDate=$pub_start" \
+		--data-urlencode "pubEndDate=$pub_end" \
+		--data-urlencode "keywordSearch=$KEYWORD"
 }
 
-# TODO: Improve this
-display_help() {
-	msg "help message"
-	exit 0
+fetch_nvd_cves() {
+	local -n files_ref="$1"
+
+	local actual_date="$EPOCHSECONDS"
+
+	local -i i w_new w_old
+	local cache_file window_old window_new
+	for(( i=1; i<=SEARCH_TIMES; i++ )) {
+		w_new=$(( actual_date - (i-1) * _120_DAYS ))
+		w_old=$(( w_new - _120_DAYS ))
+
+		(( w_old <= LIMIT_DATE )) && break
+		(( w_new < LIMIT_DATE && (w_new = LIMIT_DATE) )) || :
+
+		cache_file="$CACHE_DIR/nvd_dump_${KEYWORD_CLEAN}.${i}.json"
+
+		if ! [[ -e "$cache_file" ]]; then
+			window_old=$(unix_time2date "$w_old")
+			window_new=$(unix_time2date "$w_new")
+
+			log "fetching data: range=${window_old}-${window_new} | keyword='$KEYWORD' | cache_file=$cache_file"
+
+			fetch_nvd_cves_api "$window_old" "$window_new" "$KEYWORD" > "$cache_file"
+			command sleep "$WAIT_SECONDS"
+		else
+			log "cache: $cache_file"
+		fi
+
+		files_ref+=("$cache_file")
+
+		(( w_new == LIMIT_DATE )) && break
+	}
+
+	log "files: ${files_ref[*]}"
 }
 
-display_invalid_option() {
-	msg "Invalid option '$1'"
-	msg "Use '$0 --help' for more informations."
-	exit 1
+catch_total_results() {
+	local -n files_ref="$1" total_ref="$2"
+
+	local file v_tr
+	for file in "${files_ref[@]}"; do
+		v_tr=$(jq -r .totalResults "$file")
+		total_ref+=${v_tr}
+
+		log "$file -> size: $(file_size "$file")"
+		log "$file -> totalResults: $v_tr"
+	done
+}
+
+catch_vulns() {
+	local -n files_ref="$1" vulns_ref="$2"
+
+	local file_index
+	for file_index in "${!files_ref[@]}"; do
+		(( file_index == 0 )) && {
+			vulns_ref+=".[0].vulnerabilities"
+			continue
+		}
+
+		vulns_ref+=" + .[$file_index].vulnerabilities"
+
+		(( file_index + 1 == "${#files_ref[@]}" )) && break
+	done
 }
 
 main() {
@@ -65,67 +170,18 @@ main() {
 	log "cache dir: $CACHE_DIR"
 	log "search times: $SEARCH_TIMES"
 
-	mkdir -p "$CACHE_DIR" 2>&-
+	command mkdir -p "$CACHE_DIR" 2>&-
 
-	local cache_dir
-	local actual_date="$EPOCHSECONDS"
-	local _120_days=$(( 120 * 24 * 60 * 60 ))
-
-	local -a files
-
-	local pub_end_date="$actual_date"
-	local pub_start_date=$(( pub_end_date - _120_days ))
-
-	local start end
-	for(( i=1; i<=SEARCH_TIMES; i++ )) {
-		start=$(unix_time2date "$pub_start_date")
-		end=$(unix_time2date "$pub_end_date")
-
-		file="$CACHE_DIR/nvd_dump_${i}.json"
-
-		log "search range: $start - $end"
-		[[ -e "$file" ]] || {
-			fetch_nvd_cves "$start" "$end" "$KEYWORD" > "$file"
-			log "sleep 15 seconds..."
-			sleep 15
-		}
-
-		files+=("$file")
-
-		pub_end_date="$pub_start_date"
-		pub_start_date=$(( pub_end_date - _120_days ))
-	}
-	unset i
-
-	log "files: ${files[@]}"
-
-	declare -i total_results=0
-
-	for file in "${files[@]}"; do
-		v_tr=$(jq -r .totalResults "$file")
-		total_results+=${v_tr}
-
-		log "$file -> size: $(du -h $file | cut -f1)"
-		log "$file -> totalResults: $v_tr"
-	done
-	unset file
-
+	local files=()
+	local -i total_results=0
 	local vulns=""
 
-	for file_index in "${!files[@]}"; do
-		(( file_index == 0 )) && {
-			vulns+=".[0].vulnerabilities"
-			continue
-		}
+	fetch_nvd_cves files
+	catch_total_results files total_results
+	catch_vulns files vulns
 
-		vulns+=" + .[$file_index].vulnerabilities"
-
-		(( file_index + 1 == "${#files[@]}" )) && break
-	done
-	unset file_index
-
-	jq \
-		--arg tr "$total_results" \
+	command jq \
+		--argjson tr "$total_results" \
 		-s "{
 			startIndex: 0,
 			totalResults: \$tr,
@@ -136,7 +192,7 @@ main() {
 		}" \
 		"${files[@]}" > "$OUT_FILE"
 
-	log "$OUT_FILE -> size: $(du -h $OUT_FILE | cut -f1)"
+	log "$OUT_FILE -> size: $(file_size "$OUT_FILE")"
 	log "$OUT_FILE -> totalResults: $total_results"
 
 	log "done."
@@ -144,44 +200,33 @@ main() {
 
 (( $# == 0 )) && display_default_message
 
-OUT_FILE="nvd_dump_out.json"
-KEYWORD=""
-CACHE_DIR="${TMPDIR:-/tmp}/nvd-dump"
-SEARCH_TIMES=1
+: "${OUT_FILE:=$CONFIG_DEFAULT_OUTFILE}"
+: "${CACHE_DIR:=${TMPDIR:-/tmp}/nvd-dump}"
+: "${SEARCH_TIMES:=1}"
+: "${KEYWORD:=}"
+: "${WAIT_SECONDS:=10}"
 
 while (( $# > 0 )); do
 	case "$1" in
-		--help|-h)
-			display_help
-			;;
-		--output|-o)
-			OUT_FILE="$2"
-			shift 2
-			;;
-		--keyword|-k)
-			KEYWORD="$2"
-			shift 2
-			;;
-		--cache-dir)
-			CACHE_DIR="$2"
-			shift 2
-			;;
-		--search-times|-t)
-			declare -i SEARCH_TIMES=$2
-			shift 2
-			;;
-		--clear-caches|-c)
-			rm -rfv "$CACHE_DIR"
-			exit $?
-			;;
-		*)
-			display_invalid_option "$1"
- 			;;
+	--cache-dir) CACHE_DIR="$2" ;;
+	--clear-caches|-c) command rm -rfv "$CACHE_DIR"; exit $? ;;
+	--help|-h) display_help ;;
+	--keyword|-k) KEYWORD="$2" ;;
+	--output|-o) OUT_FILE="$2" ;;
+	--search-times|-t) declare -i SEARCH_TIMES=$2 ;;
+	--) break ;;
+	*) display_invalid_option "$1" ;;
 	esac
+
+	shift 2
 done
 
 [[ -z "$KEYWORD" ]] && {
 	die "keyword not defined. use --keyword option."
 }
+
+KEYWORD_CLEAN="${KEYWORD//[!0-9a-zA-Z]/_}"
+LIMIT_DATE=$(date2unix_time "1999-10-01") # first NVD CVE
+_120_DAYS=$(( 120 * 24 * 60 * 60 ))
 
 main
